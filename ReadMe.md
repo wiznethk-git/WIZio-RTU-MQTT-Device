@@ -14,3 +14,4 @@ If you found any Syntax Error when uploading these files, try reuploading given 
 `main.py` should automatically run afterwards.
 
 Visit [WIZio-RTU MQTT documentation](https://docs.w5500.com/reference/wiz-rtu.html#mqtt-device) for detailed guide.
+
