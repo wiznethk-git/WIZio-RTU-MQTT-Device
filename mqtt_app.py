@@ -133,10 +133,11 @@ def read_from_eeprom(msg):
     try:
         msg = json.loads(msg)
     except Exception as e:
-        dprint('Failed to load json.')
+        print('Failed to load json.')
+        dprint(e)
         return
     data = client.device.eeprom_read(int(msg.get('index', 0)))
-    client.client.publish(b'eeprom/read/response', data)
+    client.publish(b'eeprom/read/response', data)
 
 @client.add_topic('eeprom/wipe')  
 def wipe_eeprom(msg):
@@ -144,16 +145,55 @@ def wipe_eeprom(msg):
     if msg.decode('utf-8') == "True":
         client.device.eeprom_wipe()
         
+# ============ CAN =============
+@client.add_topic('CAN/send')
+def write_to_can(msg):
+    dprint("Write to CAN bus")
+    try:
+        msg = json.loads(msg)
+    except Exception as e:
+        print("Failed to load Json")
+        dprint(e)
+        return
+    can_id, can_data = msg.get("id", "0x00"), msg.get("msg", b'\x00'*8)
+    
+    # Normalize 0x123 hexstring to 0x123 hexadecimal
+    can_id = int(can_id, 16)
+    
+    # Normalize 0x112233 to bytearray \x11\x22\x33
+    can_data = bytes.fromhex(can_data[2:])
+    
+    success = client.device.send_can_frame(can_id, can_data)
+    dprint("CAN write: ", success)
+    
+    
+# =========== 4g ================
+@client.add_topic("modem/command")
+def write_to_modem(cmd):
+    dprint("Write to Modem")
+    if not isinstance(cmd, (bytes, bytearray)):
+        try:
+            cmd = cmd.encode()
+        except UnicodeError:
+            dprint(f"Failed to encode cmd: {cmd}")
+    dprint(cmd)
+    success = client.device.write_to_modem(cmd)
+    dprint("Modem write: ", success)
+    
 def start():
     while True:
         try:
             client.run()
         except Exception as e:
-            print('Error: ', e)
+            print('========== Error ===========')
+            if DEBUG:
+                raise e
+            else:
+                print (e, '\n')
             client.disconnect()
             client.restart = False
             break
-        except:
+        except KeyboardInterrupt:
             client.disconnect()
             client.restart = False
             break

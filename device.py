@@ -1,5 +1,8 @@
-from machine import Pin, DAC, ADC, UART, SoftI2C
+import time
+from machine import Pin, DAC, ADC, UART, SoftI2C, CAN
 from eeprom import EEPROM
+from validation import is_valid_can_id, is_valid_can_data
+from debug import dprint
 
 MAX_DO = const(8)
 MAX_DI = const(8)
@@ -22,13 +25,41 @@ DAC_CONFIG = {
     1: (0.079, 9.88)
 }
 
-# UART default Configs
-from config import UART_CONFIGS
+# UART and CAN default Configs
+# Default uses CAN, import UART if not available
+try:
+    from config import CAN_USED , CAN_CONFIGS
+except ImportError:
+    CAN_USED = True
+    CAN_CONFIGS = {}
+
+if not CAN_USED:
+    try:
+        from config import UART_CONFIGS
+    except ImportError:
+        UART_CONFIGS = {}
+
+# CAN
+CAN_TIMEOUT = const(1000)
+MAX_CAN_FRAMES = const(3)
 
 # EEPROM
 MAX_EEPROM_BYTES_PER_WRITE = const(1000)
 MAX_EEPROM_BYTES_PER_READ = const(1000)
 EEPROM_ADDRS = set(range(0x50, 0x58))
+
+# 4G_MODULE (MODEM)
+try:
+    from config import MODEM_CONFIGS
+except ImportError:
+    MODEM_CONFIGS = {}
+
+if MODEM_CONFIGS:
+    from modem import ModemManager
+
+# Extra
+
+
 
 
 class Device:
@@ -42,19 +73,38 @@ class Device:
             self.analog_in.append((pin, mode))
         self.analog_out = [DAC(Pin(f'AO{idx}'), bits = DAC_BITS) for idx in range(MAX_AO)]
         
-        # UART
-        self.uart_baudrate = UART_CONFIGS.get('baudrate', 9600)
-        self.uart_bits = UART_CONFIGS.get('bits', 8)
-        self.uart_parity = UART_CONFIGS.get('parity', None)
-        self.uart_stop = UART_CONFIGS.get('stop', 1)
-        self.serial = UART(
-            3,
-            self.uart_baudrate,
-            self.uart_bits,
-            self.uart_parity,
-            self.uart_stop,
-        )
-        
+        # UART/CAN for Pin(PB9, PB8)
+        self.serial = None
+        self.can_bus = None
+        dprint(f"Initing CAN_USED: {CAN_USED}")
+        if not CAN_USED:
+            self.uart_baudrate = UART_CONFIGS.get('baudrate', 9600)
+            self.uart_bits = UART_CONFIGS.get('bits', 8)
+            self.uart_parity = UART_CONFIGS.get('parity', None)
+            self.uart_stop = UART_CONFIGS.get('stop', 1)
+            self.serial = UART(
+                3,
+                self.uart_baudrate,
+                self.uart_bits,
+                self.uart_parity,
+                self.uart_stop,
+            )
+        else:
+            self.can_baudrate = CAN_CONFIGS.get('baudrate', 500000)
+            self.can_mode = CAN_CONFIGS.get('mode', CAN.NORMAL)
+            self.can_bus = CAN(
+                1,
+                baudrate = self.can_baudrate,
+                mode = self.can_mode,
+                rx = Pin("PB8"),
+                tx = Pin("PB9"),
+            )
+#             self.can_rstart = 0
+#             self.can_rend = 0
+#             self.can_rcount = 0
+#             self.can_ringbuf = [bytearray(32) for _ in range(MAX_CAN_FRAMES)]
+                
+            
         # I2C, can have more than 1 I2C device
         self.i2c = SoftI2C(scl=Pin('PB6'), sda=Pin('PB7') )  
         
@@ -66,6 +116,15 @@ class Device:
                 bpp = 16,
                 i2c = self.i2c
             )
+        # 4G
+        self.modem = None
+        if MODEM_CONFIGS:
+             self.modem = ModemManager(
+                MODEM_CONFIGS.get("baudrate", 115200),
+                MODEM_CONFIGS.get("bits", 8),
+                MODEM_CONFIGS.get("parity", None),
+                MODEM_CONFIGS.get("stop", 1)     
+             )
         
         
     # Digital I/O
@@ -193,23 +252,22 @@ class Device:
     def uart_transmission(self, message):
         if not self.send_uart_message(message.encode()):
             return None
-        
-        
+                
     def send_uart_message(self, message):
-        assert self.serial is not None
-        if not isinstance(message, (bytes, bytearray)):
-            message = message.encode('utf-8')
+        if self.serial is None:
+            return
         head = 0
         while head < len(message):
             mv = memoryview(message)[head:]
-            num_bytes = self.serial.write(mv)
+            num_bytes = self.serial.write(message)
             if not num_bytes:
                 return False
             head += num_bytes
         return True
     
     def recv_uart_message(self):
-        assert self.serial is not None
+        if self.serial is None:
+            return
         if not self.serial.any() > 0: 
             return None
         data = bytearray()
@@ -223,6 +281,50 @@ class Device:
                 print('Decoding uart failed. Please check your UART port settings.')
                 print('Raw: ', data)
         return None
+    
+    # CAN
+    def send_can_frame(self, can_id , data):
+        if not self.can_bus:
+            print('Can bus not initialized')
+            return False        
+        if not isinstance(data, (bytes, bytearray)):
+            try:
+                data = data.encode()
+            except Exception as e:
+                print("Can't decode data: ", data)
+                dprint(e)
+                return False           
+        if not (is_valid_can_id(can_id) and is_valid_can_data(data)):
+            return False
+        try:
+            self.can_bus.send(data, can_id)
+        except OSError as e:
+            print('Error in can data send.')
+            dprint(e)
+            return False
+        return True
+            
+    def recv_can_frames(self):
+        if not self.can_bus:
+            print('Can bus not initialized')
+            return None
+        
+        if not self.can_bus.any():
+            return None
+        
+        
+#         return self.drain_can_ringbuf()
+        frames = []
+    
+        while self.can_bus.any() and len(frames) < MAX_CAN_FRAMES:
+            raw_frame = self.can_bus.recv(0, CAN_TIMEOUT)
+            frame_data = {}
+            frame_data["id"] = raw_frame[0]
+            frame_data["data"] = raw_frame[1]
+            frame_data["frame_type"] = raw_frame[2]
+            frames.append(frame_data)
+        return frames
+            
     # I2C
     # EEPROM
     def _is_eeprom_connected(self):
@@ -256,4 +358,26 @@ class Device:
         assert self.eeprom is not None
         self.eeprom.wipe()
         
+    # 4G
+    def write_to_modem(self, command):
+        if self.modem is None:
+            return
+        return self.modem.write(command)
+                              
+    def read_from_modem(self):
+        if self.modem is None:
+            return
+        return self.modem.read()
     
+#     def disconnect(self):
+#         self.modem.power_off()
+    
+    # Helper functions
+#     def read_to_ws(self, ws = None, target = None):
+#         if ws is None:
+#             return
+#         if target == "CAN":
+#             self._()
+        
+        
+

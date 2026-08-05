@@ -6,7 +6,8 @@ import time
 import array
 from setup import SetUpWiznetChip
 from debug import dprint
-from device import Device , ADC_MODE_VOLTAGE ,ADC_MODE_CURRENT
+from device import Device , ADC_MODE_VOLTAGE ,ADC_MODE_CURRENT, CAN_USED
+from binascii import b2a_base64
 
 try:
     from umqtt.simple import MQTTClient
@@ -66,6 +67,7 @@ class DeviceMQTT:
             self.subscribe_all()
             return True
         except Exception as e:
+            print('Connection error in MQTT.')
             print(str(e))
         return False
     
@@ -103,18 +105,21 @@ class DeviceMQTT:
     def ping(self):
         self.client.ping()
         
-    def publish(self, topic, msg):
+    def publish(self, topic, msg, retain = True):
         if isinstance(msg, dict):
             msg = json.dumps(msg)
         elif not isinstance(msg, bytes):
             msg = msg.encode()
-        self.client.publish(topic, msg, retain = True)
+        self.client.publish(topic, msg, retain = retain)
     
     def disconnect(self):
         if self.client is not None and self.is_connected:
             self.client.disconnect()
             self.is_connected = False
-            
+#         if self.device is not None:
+#             self.device.disconnect()
+# 
+
     def _set_config(self):
         try:
             data = None
@@ -141,12 +146,12 @@ class DeviceMQTT:
    
     def run(self):
         assert self.client is not None
-        self.disconnect()
+        dprint('Start MQTT run')
         
         # Connect to MQTT Server
         if not self.connect():
-            dprint('Something wrong if connecting to server...')
-            return -1
+            print('Something wrong if connecting to server...')
+            raise Exception('MQTTConnection Error')
         
         # Start by publishing all states to MQTTClient
         self._publish_all()
@@ -194,6 +199,10 @@ class DeviceMQTT:
             data = json.dumps({"voltage": 0})
             self.publish(f'analog_output/AO{idx}/state', data)
         
+        gc.collect()
+        data = json.dumps({"Mode": "CAN" if CAN_USED else "RS485"})
+        self.publish(f'serial_mode', data)
+        
         
 
     # Polling update   
@@ -201,6 +210,8 @@ class DeviceMQTT:
         self._poll_uart()
         self._poll_din()
         self._poll_ain()
+        self._poll_can()
+        self._poll_modem()
     
     def _poll_uart(self):
         data = self.device.recv_uart_message()
@@ -240,6 +251,34 @@ class DeviceMQTT:
                 data[key]["mode"] = self.device.analog_in[i][1] 
                 readings.clear()
             self.publish('analog_input/state', json.dumps(data))
+    
+    def _poll_can(self):
+        frames = self.device.recv_can_frames()
+        if not frames:
+            return
+        for frame in frames:
+            data = {
+                "id": hex(frame["id"]),
+                "data": bytes.hex(frame["data"]),
+                "frame_type": "extended" if frame["frame_type"] else "standard"
+            }
+            self.publish('CAN/recv', data, retain = False)
+            del data
+    
+    def _poll_modem(self):
+        if not self.device.modem:
+            return
+        modem = self.device.modem.modem
+        data = {"msg": None, "work_mode": 0}
+        while modem.any():
+            buf = modem.read(512)
+            data["msg"] = b2a_base64(buf).strip().decode("utf-8")
+            data["work_mode"] = self.device.modem.wkmod
+            
+            # Sometimes you may need to change modem based on given command
+            self.device.modem.process_rx_data(buf)
+            
+            self.publish("modem/recv", json.dumps(data), retain = False)
         
     # Network
     def _send_network_details(self):
@@ -254,4 +293,6 @@ class DeviceMQTT:
             'dhcp': dhcp
         })
         self.publish('network_config/state', data)
+        
+
         

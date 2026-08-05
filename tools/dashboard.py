@@ -6,6 +6,8 @@ import time
 import json
 import ast
 import queue
+import base64
+import binascii
 try:
     from config import USERNAME, PASSWORD
 except ImportError:
@@ -49,6 +51,11 @@ class DeviceDashboard:
         self.topic_eeprom_read_response = tk.StringVar(value="eeprom/read/response")
         self.topic_uart_write = tk.StringVar(value="uart/write")
         self.topic_uart_read = tk.StringVar(value="uart/read")
+        self.topic_modem_command = tk.StringVar(value="modem/command")
+        self.topic_modem_recv = tk.StringVar(value="modem/recv")
+        self.topic_can_send = tk.StringVar(value="CAN/send")
+        self.topic_can_recv = tk.StringVar(value="CAN/recv")
+        self.topic_serial_mode = tk.StringVar(value="serial_mode")
 
         # -------------------------------------------------
         # Runtime state
@@ -97,6 +104,13 @@ class DeviceDashboard:
 
         # UART state
         self.uart_last_read_bytes = b""
+
+        # 4G modem state
+        self.modem_last_read_bytes = b""
+
+        # CAN / serial interface state
+        self.can_last_read = None
+        self.serial_mode = None
 
         # -------------------------------------------------
         # Build UI
@@ -257,6 +271,9 @@ class DeviceDashboard:
             self.topic_pattern_to_subscribe_topic(self.topic_analog_output_state.get().strip()),
             self.topic_eeprom_read_response.get().strip(),
             self.topic_uart_read.get().strip(),
+            self.topic_modem_recv.get().strip(),
+            self.topic_can_recv.get().strip(),
+            self.topic_serial_mode.get().strip(),
         ]
 
         seen = set()
@@ -324,6 +341,12 @@ class DeviceDashboard:
                 self.handle_eeprom_read_response_payload(raw_payload)
             elif topic == self.topic_uart_read.get().strip():
                 self.handle_uart_read_payload(raw_payload)
+            elif topic == self.topic_modem_recv.get().strip():
+                self.handle_modem_recv_payload(raw_payload)
+            elif topic == self.topic_can_recv.get().strip():
+                self.handle_can_recv_payload(raw_payload)
+            elif topic == self.topic_serial_mode.get().strip():
+                self.handle_serial_mode_payload(raw_payload)
 
         self.schedule_gui_update(gui_update)
 
@@ -394,6 +417,12 @@ class DeviceDashboard:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    def int_from_value(self, value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     def topic_pattern_to_subscribe_topic(self, pattern):
         """
@@ -832,6 +861,437 @@ class DeviceDashboard:
         if hasattr(self, "uart_write_box"):
             self.uart_write_box.delete("1.0", "end")
 
+
+    # =====================================================
+    # 4G modem
+    # =====================================================
+    def publish_modem_command(self):
+        """
+        Publish the text exactly as entered.
+
+        The MQTT payload is raw UTF-8 text, not JSON and not Base64.
+        Actual newline characters entered in the text area are preserved.
+        """
+        if not hasattr(self, "modem_command_box"):
+            return
+
+        text = self.modem_command_box.get("1.0", "end-1c")
+        data = text.encode("utf-8")
+        topic = self.topic_modem_command.get().strip()
+
+        if not topic:
+            messagebox.showwarning("Missing Topic", "Modem command topic is empty.")
+            return
+
+        if self.publish_message(topic, data):
+            self.append_modem_message("SEND", text, len(data))
+            self.write_log(
+                f"Modem command sent to [{topic}] with {len(data)} UTF-8 bytes"
+            )
+
+    def handle_modem_recv_payload(self, raw_payload):
+        """
+        Expected MQTT payload on modem/recv:
+
+            publish("modem/recv", {
+                "msg": b2a_base64(buf).strip().decode("utf-8"),
+                "work_mode": 0,
+            })
+
+        work_mode 0 displays a normal labelled RX block. work_mode > 0 appends
+        decoded text directly so terminal streaming output stays continuous.
+        """
+        try:
+            payload_obj = json.loads(raw_payload.decode("utf-8", errors="replace"))
+        except (TypeError, ValueError) as exc:
+            self.write_log(
+                f"Invalid modem JSON payload received from "
+                f"[{self.topic_modem_recv.get().strip()}]: {exc}"
+            )
+            return
+
+        if not isinstance(payload_obj, dict):
+            self.write_log(
+                f"Invalid modem payload received from "
+                f"[{self.topic_modem_recv.get().strip()}]: expected JSON object"
+            )
+            return
+
+        encoded_payload = str(payload_obj.get("msg", "")).strip().encode("ascii", errors="ignore")
+        work_mode = self.int_from_value(payload_obj.get("work_mode"), default=0)
+
+        try:
+            decoded_bytes = base64.b64decode(encoded_payload, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            self.write_log(
+                f"Invalid Base64 payload received from "
+                f"[{self.topic_modem_recv.get().strip()}]: {exc}"
+            )
+            return
+
+        self.modem_last_read_bytes = decoded_bytes
+        decoded_text = decoded_bytes.decode("utf-8", errors="replace")
+
+        self.append_modem_message(
+            "RECEIVE",
+            decoded_text + '\n',
+            len(decoded_bytes),
+            encoded_byte_count=len(raw_payload),
+            stream_mode=work_mode > 0,
+        )
+
+        if hasattr(self, "modem_last_received_label"):
+            self.modem_last_received_label.config(
+                text=(
+                    f"Last RX: {len(decoded_bytes)} decoded bytes "
+                    f"from {len(raw_payload)} MQTT bytes, work_mode={work_mode}"
+                )
+            )
+
+        self.write_log(
+            f"Modem receive decoded from [{self.topic_modem_recv.get().strip()}]: "
+            f"{len(raw_payload)} MQTT bytes -> {len(decoded_bytes)} raw bytes, "
+            f"work_mode={work_mode}"
+        )
+
+    def append_modem_message(
+        self,
+        direction,
+        text,
+        byte_count,
+        encoded_byte_count=None,
+        stream_mode=False,
+    ):
+        if not hasattr(self, "modem_history_box"):
+            return
+
+        timestamp = time.strftime("%H:%M:%S")
+        self.modem_history_box.config(state="normal")
+
+        if stream_mode:
+            tag = "stream_receive" if direction != "SEND" else "stream_send"
+            self.modem_history_box.insert("end", text, tag)
+            self.modem_history_box.config(state="disabled")
+            self.modem_history_box.see("end")
+            return
+
+        if direction == "SEND":
+            header = (
+                f"[{timestamp}] SEND DASHBOARD -> 4G MODULE "
+                f"({byte_count} UTF-8 bytes)\n"
+            )
+            tag = "send"
+        else:
+            if encoded_byte_count is None:
+                encoded_byte_count = 0
+            header = (
+                f"[{timestamp}] RECEIVE 4G MODULE -> DASHBOARD "
+                f"({byte_count} decoded bytes, "
+                f"{encoded_byte_count} Base64 MQTT bytes)\n"
+            )
+            tag = "receive"
+
+        self.modem_history_box.insert("end", header, tag)
+        self.modem_history_box.insert("end", text)
+
+        # Keep consecutive messages visually separated without changing
+        # the decoded modem data itself.
+        if not text.endswith("\n"):
+            self.modem_history_box.insert("end", "\n")
+
+        self.modem_history_box.insert("end", "-" * 78 + "\n")
+        self.modem_history_box.config(state="disabled")
+        self.modem_history_box.see("end")
+
+    def clear_modem_history(self):
+        if hasattr(self, "modem_history_box"):
+            self.modem_history_box.config(state="normal")
+            self.modem_history_box.delete("1.0", "end")
+            self.modem_history_box.config(state="disabled")
+
+        if hasattr(self, "modem_last_received_label"):
+            self.modem_last_received_label.config(text="Last RX: --")
+
+    def clear_modem_command_box(self):
+        if hasattr(self, "modem_command_box"):
+            self.modem_command_box.delete("1.0", "end")
+
+    # =====================================================
+    # Serial interface mode
+    # =====================================================
+    def handle_serial_mode_payload(self, raw_payload):
+        """
+        Expected payloads:
+            {"Mode": "CAN"}
+            {"Mode": "RS485"}
+        """
+        try:
+            if isinstance(raw_payload, (bytes, bytearray)):
+                payload_text = bytes(raw_payload).decode("utf-8")
+            else:
+                payload_text = str(raw_payload)
+
+            data = json.loads(payload_text)
+        except (ValueError, UnicodeError) as exc:
+            self.write_log(f"Invalid serial_mode JSON payload: {exc}")
+            return
+
+        if not isinstance(data, dict):
+            self.write_log("Invalid serial_mode payload: expected a mapping")
+            return
+
+        mode = data.get("Mode", data.get("mode"))
+        if not isinstance(mode, str):
+            self.write_log("Invalid serial_mode payload: Mode must be a string")
+            return
+
+        mode = mode.strip().upper()
+        if mode not in ("CAN", "RS485"):
+            self.write_log(f"Unsupported serial mode: {mode!r}")
+            return
+
+        self.apply_serial_mode(mode)
+
+    def apply_serial_mode(self, mode):
+        if not hasattr(self, "notebook"):
+            return
+
+        self.serial_mode = mode
+        selected_tab = self.notebook.select()
+
+        if mode == "CAN":
+            self.notebook.tab(self.tab_can, state="normal")
+            self.notebook.tab(self.tab_uart, state="disabled")
+
+            if selected_tab == str(self.tab_uart):
+                self.notebook.select(self.tab_can)
+
+            self.write_log("Serial mode changed to CAN: CAN tab enabled, Serial tab disabled")
+        else:
+            self.notebook.tab(self.tab_uart, state="normal")
+            self.notebook.tab(self.tab_can, state="disabled")
+
+            if selected_tab == str(self.tab_can):
+                self.notebook.select(self.tab_uart)
+
+            self.write_log("Serial mode changed to RS485: Serial tab enabled, CAN tab disabled")
+
+    # =====================================================
+    # CAN
+    # =====================================================
+    def parse_can_payload(self, raw_payload):
+        """
+        Expected CAN receive payload:
+            {"frame_type": "standard", "id": "0x0", "data": "1c98ccba0000"}
+        """
+        try:
+            if isinstance(raw_payload, (bytes, bytearray)):
+                payload_text = bytes(raw_payload).decode("utf-8")
+            else:
+                payload_text = str(raw_payload)
+
+            payload = json.loads(payload_text)
+        except (ValueError, UnicodeError) as exc:
+            self.write_log(f"Invalid CAN JSON payload: {exc}")
+            return None
+
+        if not isinstance(payload, dict):
+            self.write_log("Invalid CAN payload: expected a mapping")
+            return None
+
+        frame_type = payload.get("frame_type")
+        raw_can_id = payload.get("id")
+        data_hex = payload.get("data")
+
+        if not isinstance(frame_type, str):
+            self.write_log("Invalid CAN payload: frame_type must be a string")
+            return None
+
+        frame_type = frame_type.strip().lower()
+        if frame_type not in ("standard", "extended"):
+            self.write_log("Invalid CAN payload: frame_type must be standard or extended")
+            return None
+
+        try:
+            if isinstance(raw_can_id, str):
+                can_id = int(raw_can_id.strip(), 0)
+            else:
+                can_id = int(raw_can_id)
+        except (TypeError, ValueError):
+            self.write_log("Invalid CAN payload: id must be an integer or 0x-prefixed string")
+            return None
+
+        max_can_id = 0x7FF if frame_type == "standard" else 0x1FFFFFFF
+        if can_id < 0 or can_id > max_can_id:
+            self.write_log(
+                f"Invalid {frame_type} CAN ID: expected 0x0 to {hex(max_can_id)}"
+            )
+            return None
+
+        if not isinstance(data_hex, str):
+            self.write_log("Invalid CAN payload: data must be a hexadecimal string")
+            return None
+
+        data_hex = data_hex.strip().replace(" ", "").replace(",", "")
+        if data_hex.lower().startswith("0x"):
+            data_hex = data_hex[2:]
+
+        if len(data_hex) % 2:
+            self.write_log("Invalid CAN payload: data must contain complete byte pairs")
+            return None
+
+        try:
+            can_data = bytes.fromhex(data_hex)
+        except ValueError:
+            self.write_log("Invalid CAN payload: data contains non-hexadecimal characters")
+            return None
+
+        if len(can_data) > 8:
+            self.write_log("Invalid CAN payload: classic CAN supports at most 8 data bytes")
+            return None
+
+        return {
+            "frame_type": frame_type,
+            "id": can_id,
+            "data": can_data,
+        }
+
+    def can_bytes_from_text(self, text):
+        """
+        Accept either spaced hex bytes:
+            01 02 A0 FF
+
+        or compact hexadecimal:
+            0102A0FF
+        """
+        cleaned = text.strip().replace(",", " ").replace("0x", "")
+        cleaned = "".join(cleaned.split())
+
+        if not cleaned:
+            return b""
+
+        if len(cleaned) % 2:
+            raise ValueError("CAN data must contain complete hexadecimal byte pairs")
+
+        try:
+            data = bytes.fromhex(cleaned)
+        except ValueError:
+            raise ValueError("CAN data must contain only hexadecimal bytes")
+
+        if len(data) > 8:
+            raise ValueError("Classic CAN allows at most 8 data bytes")
+
+        return data
+
+    def publish_can_message(self):
+        can_id_text = self.can_id_var.get().strip()
+        can_data_text = self.can_data_box.get("1.0", "end-1c")
+
+        try:
+            can_id = int(can_id_text, 0)
+        except ValueError:
+            messagebox.showwarning("Invalid CAN ID", "Enter a CAN ID such as 0x123 or 291.")
+            return
+
+        if can_id < 0 or can_id > 0x1FFFFFFF:
+            messagebox.showwarning("Invalid CAN ID", "CAN ID must be between 0x0 and 0x1FFFFFFF.")
+            return
+
+        try:
+            can_data = self.can_bytes_from_text(can_data_text)
+        except ValueError as exc:
+            messagebox.showwarning("Invalid CAN Data", str(exc))
+            return
+
+        # JSON has no hexadecimal number type, so send the CAN ID as a string.
+        # MQTT payload example:
+        #     {"id": "0x123", "msg": "0x112233"}
+        payload = json.dumps({
+            "id": hex(can_id),
+            "msg": "0x" + can_data.hex(),
+        })
+        topic = self.topic_can_send.get().strip()
+
+        if not topic:
+            messagebox.showwarning("Missing Topic", "CAN send topic is empty.")
+            return
+
+        if self.publish_message(topic, payload):
+            self.append_can_message("SEND", can_id, can_data)
+            self.write_log(
+                f"CAN frame published to [{topic}]: id={hex(can_id)}, "
+                f"{len(can_data)} bytes"
+            )
+
+    def handle_can_recv_payload(self, raw_payload):
+        frame = self.parse_can_payload(raw_payload)
+        if frame is None:
+            return
+
+        self.can_last_read = frame
+        self.append_can_message(
+            "RECEIVE",
+            frame["id"],
+            frame["data"],
+            frame_type=frame["frame_type"],
+        )
+
+        if hasattr(self, "can_last_received_label"):
+            self.can_last_received_label.config(
+                text=(
+                    f"Last RX: {frame['frame_type'].upper()}  "
+                    f"ID={hex(frame['id'])}  DATA={frame['data'].hex()}"
+                )
+            )
+
+        self.write_log(
+            f"CAN frame received from [{self.topic_can_recv.get().strip()}]: "
+            f"type={frame['frame_type']}, id={hex(frame['id'])}, "
+            f"data={frame['data'].hex()}"
+        )
+
+    def append_can_message(self, direction, can_id, message, frame_type=None):
+        if not hasattr(self, "can_history_box"):
+            return
+
+        timestamp = time.strftime("%H:%M:%S")
+        message_hex = " ".join(f"{byte:02X}" for byte in message)
+        message_repr = repr(message)
+
+        if frame_type is None:
+            frame_type = "standard" if can_id <= 0x7FF else "extended"
+
+        if direction == "SEND":
+            header = (
+                f"[{timestamp}] SEND DASHBOARD -> DEVICE CAN BUS "
+                f"(TYPE={frame_type.upper()}, ID={hex(can_id)}, DLC={len(message)})\n"
+            )
+            tag = "send"
+        else:
+            header = (
+                f"[{timestamp}] RECEIVE DEVICE CAN BUS -> DASHBOARD "
+                f"(TYPE={frame_type.upper()}, ID={hex(can_id)}, DLC={len(message)})\n"
+            )
+            tag = "receive"
+
+        self.can_history_box.config(state="normal")
+        self.can_history_box.insert("end", header, tag)
+        self.can_history_box.insert("end", f"HEX: {message_hex or '(empty)'}\n")
+        self.can_history_box.insert("end", f"BYTES: {message_repr}\n")
+        self.can_history_box.insert("end", "-" * 78 + "\n")
+        self.can_history_box.config(state="disabled")
+        self.can_history_box.see("end")
+
+    def clear_can_history(self):
+        if hasattr(self, "can_history_box"):
+            self.can_history_box.config(state="normal")
+            self.can_history_box.delete("1.0", "end")
+            self.can_history_box.config(state="disabled")
+
+    def clear_can_data_box(self):
+        if hasattr(self, "can_data_box"):
+            self.can_data_box.delete("1.0", "end")
+
     # =====================================================
     # UI setup
     # =====================================================
@@ -849,8 +1309,16 @@ class DeviceDashboard:
         )
         style.map(
             "TNotebook.Tab",
-            background=[("selected", "#1F2937")],
-            foreground=[("selected", "#93C5FD")]
+            background=[
+                ("disabled", "#171C26"),
+                ("selected", "#1F2937"),
+                ("!selected", "#374151"),
+            ],
+            foreground=[
+                ("disabled", "#6B7280"),
+                ("selected", "#93C5FD"),
+                ("!selected", "white"),
+            ],
         )
 
     def build_header(self):
@@ -877,22 +1345,26 @@ class DeviceDashboard:
         self.clock_label.pack(side="right", padx=20)
 
     def build_main_tabs(self):
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=14, pady=14)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=14, pady=14)
 
-        self.tab_connection = tk.Frame(notebook, bg="#111827")
-        self.tab_network = tk.Frame(notebook, bg="#111827")
-        self.tab_io = tk.Frame(notebook, bg="#111827")
-        self.tab_analog_io = tk.Frame(notebook, bg="#111827")
-        self.tab_eeprom = tk.Frame(notebook, bg="#111827")
-        self.tab_uart = tk.Frame(notebook, bg="#111827")
+        self.tab_connection = tk.Frame(self.notebook, bg="#111827")
+        self.tab_network = tk.Frame(self.notebook, bg="#111827")
+        self.tab_io = tk.Frame(self.notebook, bg="#111827")
+        self.tab_analog_io = tk.Frame(self.notebook, bg="#111827")
+        self.tab_eeprom = tk.Frame(self.notebook, bg="#111827")
+        self.tab_uart = tk.Frame(self.notebook, bg="#111827")
+        self.tab_modem = tk.Frame(self.notebook, bg="#111827")
+        self.tab_can = tk.Frame(self.notebook, bg="#111827")
 
-        notebook.add(self.tab_connection, text="Connection")
-        notebook.add(self.tab_network, text="Network Configurations")
-        notebook.add(self.tab_io, text="Digital I/O")
-        notebook.add(self.tab_analog_io, text="Analog I/O")
-        notebook.add(self.tab_eeprom, text="EEPROM")
-        notebook.add(self.tab_uart, text="Serial")
+        self.notebook.add(self.tab_connection, text="Connection")
+        self.notebook.add(self.tab_network, text="Network Configurations")
+        self.notebook.add(self.tab_io, text="Digital I/O")
+        self.notebook.add(self.tab_analog_io, text="Analog I/O")
+        self.notebook.add(self.tab_eeprom, text="EEPROM")
+        self.notebook.add(self.tab_uart, text="Serial")
+        self.notebook.add(self.tab_modem, text="4G Modem")
+        self.notebook.add(self.tab_can, text="CAN")
 
         self.build_connection_tab()
         self.build_network_tab()
@@ -900,6 +1372,8 @@ class DeviceDashboard:
         self.build_analog_io_tab()
         self.build_eeprom_tab()
         self.build_uart_tab()
+        self.build_modem_tab()
+        self.build_can_tab()
 
     # =====================================================
     # Tab: Connection
@@ -1037,6 +1511,11 @@ class DeviceDashboard:
             ("EEPROM Read Response", self.topic_eeprom_read_response),
             ("UART Write", self.topic_uart_write),
             ("UART Read", self.topic_uart_read),
+            ("Modem Command", self.topic_modem_command),
+            ("Modem Receive", self.topic_modem_recv),
+            ("CAN Send", self.topic_can_send),
+            ("CAN Receive", self.topic_can_recv),
+            ("Serial Mode", self.topic_serial_mode),
         ]
 
         canvas = tk.Canvas(
@@ -1863,6 +2342,331 @@ class DeviceDashboard:
             height=2
         )
         clear_history_btn.place(x=660, y=525)
+
+
+    # =====================================================
+    # Tab: 4G Modem
+    # =====================================================
+    def build_modem_tab(self):
+        wrapper = tk.Frame(self.tab_modem, bg="#111827")
+        wrapper.pack(fill="both", expand=True, padx=10, pady=10)
+
+        modem_card = self.make_card(
+            wrapper,
+            "4G MODEM COMMAND / RECEIVE",
+            1320,
+            620,
+        )
+        modem_card.pack(fill="both", expand=True)
+
+        command_info = (
+            "Command Topic:\n"
+            "  modem/command\n\n"
+            "Dashboard payload:\n"
+            "  Raw UTF-8 text only (no JSON and no Base64).\n\n"
+            "The command box is a multiline text area.\n"
+            "Actual newline characters are published unchanged.\n\n"
+            "Examples:\n"
+            "  AT\n"
+            "  AT+CSQ\n"
+            "  AT+UART?\n"
+        )
+        tk.Label(
+            modem_card,
+            text=command_info,
+            bg="#1F2937",
+            fg="#D1D5DB",
+            font=("Consolas", 10),
+            justify="left",
+            anchor="nw",
+        ).place(x=28, y=58, width=570, height=240)
+
+        receive_info = (
+            "Receive Topic:\n"
+            "  modem/recv\n\n"
+            "Device publish form:\n"
+            "  {\n"
+            "    \"msg\": b2a_base64(buf).strip().decode(\"utf-8\"),\n"
+            "    \"work_mode\": 0\n"
+            "  }\n\n"
+            "Dashboard action:\n"
+            "  1. Decode msg from Base64 to original bytes.\n"
+            "  2. work_mode 0 shows labelled RX blocks.\n"
+            "  3. work_mode > 0 appends directly to terminal.\n"
+        )
+        tk.Label(
+            modem_card,
+            text=receive_info,
+            bg="#1F2937",
+            fg="#D1D5DB",
+            font=("Consolas", 10),
+            justify="left",
+            anchor="nw",
+        ).place(x=660, y=58, width=620, height=230)
+
+
+        self.modem_last_received_label = tk.Label(
+            modem_card,
+            text="Last RX: --",
+            bg="#111827",
+            fg="#60A5FA",
+            font=("Consolas", 10, "bold"),
+            anchor="w",
+            padx=10,
+        )
+        self.modem_last_received_label.place(
+            x=660,
+            y=285,
+            width=620,
+            height=25,
+        )
+        
+        tk.Label(
+            modem_card,
+            text="Modem Command (multiline raw text)",
+            bg="#1F2937",
+            fg="#F3F4F6",
+            font=("Arial", 12, "bold"),
+        ).place(x=28, y=255)
+
+        self.modem_command_box = ScrolledText(
+            modem_card,
+            bg="#0B1220",
+            fg="#F9FAFB",
+            insertbackground="white",
+            font=("Consolas", 11),
+            relief="flat",
+            wrap="word",
+        )
+        self.modem_command_box.place(
+            x=28,
+            y=290,
+            width=560,
+            height=210,
+        )
+
+        send_btn = tk.Button(
+            modem_card,
+            text="SEND MODEM COMMAND",
+            command=self.publish_modem_command,
+            bg="#10B981",
+            fg="white",
+            relief="flat",
+            font=("Arial", 12, "bold"),
+            width=21,
+            height=2,
+        )
+        send_btn.place(x=28, y=525)
+
+        clear_command_btn = tk.Button(
+            modem_card,
+            text="CLEAR TEXT",
+            command=self.clear_modem_command_box,
+            bg="#374151",
+            fg="white",
+            relief="flat",
+            font=("Arial", 11, "bold"),
+            width=14,
+            height=2,
+        )
+        clear_command_btn.place(x=270, y=525)
+
+        tk.Label(
+            modem_card,
+            text="Decoded Modem Receive History",
+            bg="#1F2937",
+            fg="#F3F4F6",
+            font=("Arial", 12, "bold"),
+        ).place(x=660, y=255)
+
+
+        self.modem_history_box = ScrolledText(
+            modem_card,
+            bg="#0B1220",
+            fg="#D1D5DB",
+            insertbackground="white",
+            font=("Consolas", 11),
+            relief="flat",
+            wrap="word",
+        )
+        self.modem_history_box.place(
+            x=660,
+            y=320,
+            width=620,
+            height=220,
+        )
+        self.modem_history_box.tag_config("send", foreground="#34D399")
+        self.modem_history_box.tag_config("receive", foreground="#60A5FA")
+        self.modem_history_box.tag_config("stream_send", foreground="#F59E0B")
+        self.modem_history_box.tag_config("stream_receive", foreground="#F59E0B")
+        self.modem_history_box.config(state="disabled")
+
+        clear_history_btn = tk.Button(
+            modem_card,
+            text="CLEAR HISTORY",
+            command=self.clear_modem_history,
+            bg="#374151",
+            fg="white",
+            relief="flat",
+            font=("Arial", 11, "bold"),
+            width=16,
+            height=2,
+        )
+        clear_history_btn.place(x=660, y=555)
+
+    # =====================================================
+    # Tab: CAN
+    # =====================================================
+    def build_can_tab(self):
+        wrapper = tk.Frame(self.tab_can, bg="#111827")
+        wrapper.pack(fill="both", expand=True, padx=10, pady=10)
+
+        can_card = self.make_card(wrapper, "CAN SEND / RECEIVE", 1320, 620)
+        can_card.pack(fill="both", expand=True)
+
+        send_info = (
+            "Send Topic:\n"
+            "  CAN/send\n\n"
+            "Direction:\n"
+            "  Dashboard -> MQTT broker -> device -> CAN bus\n\n"
+            "Payload form:\n"
+            "  {\"id\": \"0x123\", \"msg\": \"0x112233\"}\n\n"
+            "Enter data as hexadecimal bytes, for example:\n"
+            "  01 02 A0 FF"
+        )
+        tk.Label(
+            can_card,
+            text=send_info,
+            bg="#1F2937",
+            fg="#D1D5DB",
+            font=("Consolas", 10),
+            justify="left",
+            anchor="nw"
+        ).place(x=28, y=58, width=570, height=180)
+
+        recv_info = (
+            "Receive Topic:\n"
+            "  CAN/recv\n\n"
+            "Direction:\n"
+            "  Device CAN bus -> MQTT broker -> dashboard\n\n"
+            "Expected payload form:\n"
+            "  {\"frame_type\": \"standard\", \"id\": \"0x0\",\n"
+            "   \"data\": \"1c98ccba0000\"}\n\n"
+            "Incoming frames are shown as both hexadecimal bytes\n"
+            "and a Python bytes representation."
+        )
+        tk.Label(
+            can_card,
+            text=recv_info,
+            bg="#1F2937",
+            fg="#D1D5DB",
+            font=("Consolas", 10),
+            justify="left",
+            anchor="nw"
+        ).place(x=660, y=58, width=620, height=180)
+
+        self.can_last_received_label = tk.Label(
+            can_card,
+            text="Last RX: --",
+            bg="#111827",
+            fg="#60A5FA",
+            font=("Consolas", 10, "bold"),
+            anchor="w",
+            padx=10
+        )
+        self.can_last_received_label.place(x=660, y=225, width=620, height=25)
+
+        tk.Label(
+            can_card,
+            text="CAN ID",
+            bg="#1F2937",
+            fg="#F3F4F6",
+            font=("Arial", 12, "bold")
+        ).place(x=28, y=255)
+
+        self.can_id_var = tk.StringVar(value="0x123")
+        self.make_entry(can_card, self.can_id_var, 120, 250, 180)
+
+        tk.Label(
+            can_card,
+            text="CAN Data (hex, max 8 bytes)",
+            bg="#1F2937",
+            fg="#F3F4F6",
+            font=("Arial", 12, "bold")
+        ).place(x=28, y=305)
+
+        self.can_data_box = ScrolledText(
+            can_card,
+            bg="#0B1220",
+            fg="#F9FAFB",
+            insertbackground="white",
+            font=("Consolas", 12),
+            relief="flat",
+            wrap="word"
+        )
+        self.can_data_box.place(x=28, y=338, width=560, height=125)
+        self.can_data_box.insert("1.0", "0x112233")
+
+        send_btn = tk.Button(
+            can_card,
+            text="SEND CAN",
+            command=self.publish_can_message,
+            bg="#10B981",
+            fg="white",
+            relief="flat",
+            font=("Arial", 12, "bold"),
+            width=16,
+            height=2
+        )
+        send_btn.place(x=28, y=500)
+
+        clear_data_btn = tk.Button(
+            can_card,
+            text="CLEAR DATA",
+            command=self.clear_can_data_box,
+            bg="#374151",
+            fg="white",
+            relief="flat",
+            font=("Arial", 11, "bold"),
+            width=14,
+            height=2
+        )
+        clear_data_btn.place(x=220, y=500)
+
+        tk.Label(
+            can_card,
+            text="CAN Send / Receive History",
+            bg="#1F2937",
+            fg="#F3F4F6",
+            font=("Arial", 12, "bold")
+        ).place(x=660, y=255)
+
+        self.can_history_box = ScrolledText(
+            can_card,
+            bg="#0B1220",
+            fg="#D1D5DB",
+            insertbackground="white",
+            font=("Consolas", 11),
+            relief="flat",
+            wrap="word"
+        )
+        self.can_history_box.place(x=660, y=290, width=620, height=250)
+        self.can_history_box.tag_config("send", foreground="#34D399")
+        self.can_history_box.tag_config("receive", foreground="#60A5FA")
+        self.can_history_box.config(state="disabled")
+
+        clear_history_btn = tk.Button(
+            can_card,
+            text="CLEAR HISTORY",
+            command=self.clear_can_history,
+            bg="#374151",
+            fg="white",
+            relief="flat",
+            font=("Arial", 11, "bold"),
+            width=16,
+            height=2
+        )
+        clear_history_btn.place(x=660, y=555)
 
     # =====================================================
     # Helper widgets

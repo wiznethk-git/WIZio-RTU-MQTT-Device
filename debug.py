@@ -1,4 +1,7 @@
-DEBUG = False
+try:
+    from config import DEBUG
+except ImportError:
+    DEBUG = False
 
 def dprint(*args):
     if DEBUG:

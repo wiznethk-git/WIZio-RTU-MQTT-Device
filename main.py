@@ -1,6 +1,6 @@
 import gc
 import sys
-gc.threshold(16384)
+gc.threshold(4096)
 gc.enable()
 
 # Settings
