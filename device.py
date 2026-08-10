@@ -66,13 +66,18 @@ class Device:
     def __init__(self):
         self.din = [Pin(f'IN{idx + 1}', Pin.IN) for idx in range(MAX_DI)]
         self.dout = [Pin(f'RY{idx + 1}', Pin.OUT) for idx in range(MAX_DO)]
+        for pin in self.dout:
+            pin.value(0)
+       
         self.analog_in = []
         for idx in range(MAX_AI):
             pin = ADC(Pin(f'AI{idx}'))
             mode = ADC_PIN_PREDEF_MODE[idx]
             self.analog_in.append((pin, mode))
         self.analog_out = [DAC(Pin(f'AO{idx}'), bits = DAC_BITS) for idx in range(MAX_AO)]
-        
+        for pin in self.analog_out:
+            pin.write(0)
+            
         # UART/CAN for Pin(PB9, PB8)
         self.serial = None
         self.can_bus = None
@@ -369,8 +374,7 @@ class Device:
             return
         return self.modem.read()
     
-#     def disconnect(self):
-#         self.modem.power_off()
+
     
     # Helper functions
 #     def read_to_ws(self, ws = None, target = None):
