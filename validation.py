@@ -37,4 +37,3 @@ def is_valid_can_data(data):
         print(f'Max length 8 bytes exceeded.\n{data}:{len(data)}')
         return False
     return True
-

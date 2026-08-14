@@ -64,7 +64,7 @@ if MODEM_CONFIGS:
 
 class Device:
     def __init__(self):
-        self.din = [Pin(f'IN{idx + 1}', Pin.IN) for idx in range(MAX_DI)]
+        self.din = [Pin(f'IN{idx + 1}', Pin.IN, Pin.PULL_UP) for idx in range(MAX_DI)]
         self.dout = [Pin(f'RY{idx + 1}', Pin.OUT) for idx in range(MAX_DO)]
         for pin in self.dout:
             pin.value(0)
