@@ -7,4 +7,9 @@ __pycache__/
 # Virt files
 venv/
 virt/
+.venv/
+
+# Pyinstaller
+*.spec
+src/
 
